@@ -2,6 +2,9 @@
 Satel Integra 2
 ===============
 
+
+03/2026 added support for ethm 1 card (100ms polling)
+
 Communication library and basic testing tool for Satel Integra alarm system. Communication via tcpip protocol published by SATEL.
 Extended version.
 
