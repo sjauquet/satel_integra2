@@ -11,6 +11,29 @@ from enum import Enum, unique
 
 _LOGGER = logging.getLogger(__name__)
 
+# Satel name encoding table (ported from characterEncoder.lua).
+# Maps each byte value (0x00-0xFF) to the corresponding UTF-8 string.
+# 0x00-0x7F is standard ASCII; 0x80-0xFF is the Satel custom encoding
+# (Central European variant, similar to Windows-1250 with tweaks).
+_SATEL_CHAR_TABLE = [chr(i) for i in range(0x80)] + [
+    '\u20ac', '',     '\u201a', '',     '\u201e', '\u2026', '\u2020', '\u2021',  # 0x80-0x87
+    '',       '\u2030', '\u0160', '\u2039', '\u015a', '\u0164', '\u017d', '\u0179',  # 0x88-0x8f
+    '',       '\u2018', '\u2019', '\u201c', '\u201d', '\u2022', '\u2013', '\u2014',  # 0x90-0x97
+    '',       '\u2122', '\u0161', '\u203a', '\u015b', '\u0165', '\u017e', '\u017a',  # 0x98-0x9f
+    '\u00a0', '\u02c7', '\u02d8', '\u0141', '\u00a4', '\u0104', '\u00a6', '\u00a7',  # 0xa0-0xa7
+    '\u00a8', '\u00a9', '\u015e', '\u00ab', '\u00ac', '\u00ad', '\u00ae', '\u017b',  # 0xa8-0xaf
+    '\u00b0', '\u00b1', '\u02db', '\u0142', '\u00b4', '\u00b5', '\u00b6', '\u00b7',  # 0xb0-0xb7
+    '\u00b8', '\u0105', '\u015f', '\u00bb', '\u013d', '\u02dd', '\u013e', '\u017c',  # 0xb8-0xbf
+    '\u0155', '\u00c1', '\u00c2', '\u0102', '\u00c4', '\u0139', '\u0106', '\u00c7',  # 0xc0-0xc7
+    '\u010c', '\u00c9', '\u0118', '\u00cb', '\u011a', '\u00cd', '\u00ce', '\u010e',  # 0xc8-0xcf
+    '\u0110', '\u0143', '\u0147', '\u00d3', '\u00d4', '\u0150', '\u00d6', '\u00d7',  # 0xd0-0xd7
+    '\u0158', '\u016e', '\u00da', '\u0170', '\u00dc', '\u00dd', '\u0162', '\u00df',  # 0xd8-0xdf
+    '\u0155', '\u00e1', '\u00e2', '\u0103', '\u00e4', '\u013a', '\u0107', '\u00e7',  # 0xe0-0xe7
+    '\u010d', '\u00e9', '\u0119', '\u00eb', '\u011b', '\u00ed', '\u00ee', '\u010f',  # 0xe8-0xef
+    '\u0111', '\u0144', '\u0148', '\u00f3', '\u00f4', '\u0151', '\u00f6', '\u00f7',  # 0xf0-0xf7
+    '\u0159', '\u016f', '\u00fa', '\u0171', '\u00fc', '\u00fd', '\u0163', '\u02d9',  # 0xf8-0xff
+]
+
 
 def checksum(command):
     """Function to calculate checksum as per Satel manual."""
@@ -221,7 +244,7 @@ class SatelCommandQueue(asyncio.Queue):
 class AsyncSatel:
     """Asynchronous interface to talk to Satel Integra alarm system."""
 
-    def __init__(self, host, port, loop, monitored_zones=[], monitored_outputs=[], partitions=[], monitored_trouble=[],monitored_trouble2=[]):
+    def __init__(self, host, port, loop, monitored_zones=[], monitored_outputs=[], partitions=[], monitored_trouble=[],monitored_trouble2=[], polling_mode=False):
         """Init the Satel alarm data."""
         self._host = host
         self._port = port
@@ -265,6 +288,7 @@ class AsyncSatel:
         self._partitions = partitions
         self._command_status_event = asyncio.Event()
         self._command_status = False
+        self._polling_mode = polling_mode
         self._command_queue = SatelCommandQueue()
 
         self._message_handlers = {
@@ -301,7 +325,8 @@ class AsyncSatel:
         }
 
         if loop:
-            loop.create_task(self.sender_worker())
+            if not polling_mode:
+                loop.create_task(self.sender_worker())
         else:
             # loop can be null only during test-cases
             pass
@@ -555,6 +580,7 @@ class AsyncSatel:
 
         if not self._writer:
             _LOGGER.warning("Ignoring data because we're disconnected!")
+            return False
         try:
             self._writer.write(data)
             await self._writer.drain()
@@ -723,6 +749,108 @@ class AsyncSatel:
             else:
                 _LOGGER.info("Skipping command: %s", msg.cmd)
 
+    def _get_poll_commands(self, poll_msg: SatelMessage) -> list:
+        """Parse 0x7F poll response bitmap and return list of SatelCommands to query.
+
+        The 5-byte bitmap (40 bits) maps bit N (1-indexed) to command byte N-1.
+        Only commands with registered handlers are returned.
+        """
+        commands = []
+        for bit_pos in poll_msg.list_set_bits(0, 5):
+            cmd_byte = bit_pos - 1
+            try:
+                cmd = SatelCommand(cmd_byte)
+                if cmd in self._message_handlers:
+                    commands.append(cmd)
+            except ValueError:
+                _LOGGER.debug("Unknown poll bit %d (cmd 0x%02X), skipping", bit_pos, cmd_byte)
+        return commands
+
+    async def _monitor_status_polling(self):
+        """ETHM-1 polling loop: sends 0x7F every 100ms, reads change bitmap,
+        then queries each changed status individually. Also processes control
+        commands (arm/disarm/outputs) from the internal queue between poll cycles.
+        """
+        POLLING_INTERVAL = 0.1  # 100ms, same as Fibaro Lua implementation
+
+        _LOGGER.info("Starting ETHM-1 polling loop (interval: %.0fms)", POLLING_INTERVAL * 1000)
+
+        while not self.closed:
+            while not self.connected:
+                _LOGGER.info("Not connected, re-connecting...")
+                await self.connect()
+                if not self.connected:
+                    if self._retry > 0:
+                        self._retry -= 1
+                    _LOGGER.warning("Not connected, sleeping for %ds...", self._reconnection_timeout)
+                    if self._retry == 0 and self._alarm_status_callback:
+                        self._alarm_status_callback()
+                    await asyncio.sleep(self._reconnection_timeout)
+                    continue
+
+            try:
+                # Step 1: flush any pending control commands (arm/disarm/outputs)
+                # before the next poll cycle so they get immediate execution
+                while not self._command_queue.empty():
+                    try:
+                        msg = self._command_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    frame = msg.encode_frame()
+                    if await self._send_frame(frame):
+                        resp_frame = await asyncio.wait_for(self._read_frame(), timeout=5)
+                        if resp_frame:
+                            self._dispatch_frame(resp_frame)
+                    self._command_queue.task_done()
+                    if not self.connected:
+                        break
+
+                if not self.connected:
+                    continue
+
+                # Step 2: send poll command (0x7F with no data = ETHM-1 poll)
+                poll_msg = SatelMessage(SatelCommand.CMD_START_MONITORING)
+                if not await self._send_frame(poll_msg.encode_frame()):
+                    continue
+
+                # Step 3: read poll response (5-byte change bitmap, cmd byte = 0x7F)
+                poll_frame = await asyncio.wait_for(self._read_frame(), timeout=5)
+                if not poll_frame:
+                    continue
+
+                decoded = SatelMessage.decode_frame(poll_frame)
+                if decoded is None or decoded.cmd != SatelCommand.CMD_START_MONITORING:
+                    _LOGGER.warning("Unexpected response to poll: %s", decoded)
+                    continue
+
+                # Step 4: query each changed status
+                changed_cmds = self._get_poll_commands(decoded)
+                for cmd in changed_cmds:
+                    if not self.connected:
+                        break
+                    try:
+                        read_msg = SatelMessage(cmd)
+                        if not await self._send_frame(read_msg.encode_frame()):
+                            break
+                        resp_frame = await asyncio.wait_for(self._read_frame(), timeout=3)
+                        if resp_frame:
+                            self._dispatch_frame(resp_frame)
+                    except asyncio.TimeoutError:
+                        _LOGGER.warning("Timeout reading response for poll command %s", cmd)
+
+            except asyncio.TimeoutError:
+                _LOGGER.warning("Polling timeout, reconnecting")
+                self._writer = None
+                self._reader = None
+            except Exception as e:
+                _LOGGER.error("Polling error: %s", e, exc_info=True)
+                self._writer = None
+                self._reader = None
+
+            await asyncio.sleep(POLLING_INTERVAL)
+
+        _LOGGER.info("Closed, quit polling.")
+
     async def monitor_status(self, alarm_status_callback=None,
                              zone_violated_callback=None,
                              zone_alarm_callback=None,
@@ -755,7 +883,12 @@ class AsyncSatel:
         self._trouble_callback = trouble_callback
         self._trouble2_callback = trouble2_callback
 
-        _LOGGER.info("Starting monitor_status loop")
+        _LOGGER.info("Starting monitor_status loop (mode: %s)",
+                     "polling/ETHM-1" if self._polling_mode else "push/ETHM-1 Plus")
+
+        if self._polling_mode:
+            await self._monitor_status_polling()
+            return
 
         while not self.closed:
             while not self.connected:
@@ -763,7 +896,7 @@ class AsyncSatel:
                 await self.connect()
                 if not self.connected:
                     if self._retry > 0:
-                        self._retry -=1 
+                        self._retry -=1
                     _LOGGER.warning("Not connected, sleeping for 10s... ")
                     if self._retry == 0 and self._alarm_status_callback:
                         _LOGGER.warning("Too many retry... updating partition status to None")
@@ -783,6 +916,122 @@ class AsyncSatel:
                     _LOGGER.info("Got connection broken, reconnecting!")
                     break
         _LOGGER.info("Closed, quit monitoring.")
+
+    @staticmethod
+    def _decode_satel_name(name_bytes: bytes) -> str:
+        """Decode a 16-byte Satel name field using the Satel character table.
+
+        Returns an empty string if the name is blank (all zeros or spaces).
+        """
+        result = ''.join(_SATEL_CHAR_TABLE[b] for b in name_bytes)
+        return result.strip('\x00').strip()
+
+    async def _query_device_direct(self, device_type: int, device_id: int,
+                                    timeout: float = 2.0) -> dict | None:
+        """Send 0xEE [type] [id] directly and read the response synchronously.
+
+        Returns a dict with 'name', 'type_function', 'partition_id' on success,
+        or None on timeout / malformed response.
+
+        In push mode (ETHM-1 Plus), the panel continuously sends status frames.
+        This method reads frames in a loop, skipping push notifications, until
+        it finds the DEVICE_INFO response matching this specific query.
+        """
+        try:
+            msg = SatelMessage(SatelCommand.CMD_DEVICE_INFO, bytearray([device_type, device_id]))
+            if not await self._send_frame(msg.encode_frame()):
+                return None
+
+            # Read frames in a loop to skip push notifications and find our response
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + timeout
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return None
+                frame = await asyncio.wait_for(self._read_frame(), timeout=remaining)
+                if not frame:
+                    return None
+                decoded = SatelMessage.decode_frame(frame)
+                if decoded is None or decoded.cmd != SatelCommand.DEVICE_INFO:
+                    # Push notification — skip and keep reading
+                    continue
+                data = decoded.msg_data
+                # Response layout (cmd byte already stripped by decode_frame):
+                # [0] = device_type echo, [1] = device_id echo,
+                # [2] = type_function, [3:19] = name (16 bytes), [19] = partition_id (zones only)
+                if len(data) < 19:
+                    return None
+                if data[0] != device_type or data[1] != device_id:
+                    # Response for a different query — skip
+                    continue
+                type_function = data[2]
+                name = self._decode_satel_name(bytes(data[3:19]))
+                partition_id = data[19] if len(data) > 19 else 0
+                return {'name': name, 'type_function': type_function, 'partition_id': partition_id}
+        except (asyncio.TimeoutError, Exception) as e:
+            _LOGGER.debug("Device query error (type=0x%02X id=%d): %s", device_type, device_id, e)
+            return None
+
+    async def discover_devices(self, max_zones=128, max_partitions=32, max_outputs=128) -> dict:
+        """Query all zones, partitions, and outputs using the 0xEE command.
+
+        Scans device IDs 1..max_* and returns a dict:
+          {
+            'zones':      {id: {'name': str, 'type_function': int, 'partition_id': int}},
+            'partitions': {id: {'name': str, 'type_function': int}},
+            'outputs':    {id: {'name': str, 'type_function': int}},
+          }
+
+        Devices with empty names or type_function == 0 (for outputs) are excluded.
+
+        NOTE: This method does direct TCP sends/reads.  Call it after connect()
+        and before starting monitor_status() so it doesn't race with the push loop.
+        """
+        ZONE_TYPE      = 0x05
+        PARTITION_TYPE = 0x00
+        OUTPUT_TYPE    = 0x04
+
+        discovered: dict = {'zones': {}, 'partitions': {}, 'outputs': {}}
+
+        _LOGGER.info("Starting device discovery (zones: %d, partitions: %d, outputs: %d)",
+                     max_zones, max_partitions, max_outputs)
+
+        for zone_id in range(1, max_zones + 1):
+            result = await self._query_device_direct(ZONE_TYPE, zone_id)
+            if result and result['name']:
+                discovered['zones'][zone_id] = result
+                _LOGGER.debug("Discovered zone %d: '%s'", zone_id, result['name'])
+
+        for part_id in range(0, max_partitions + 1):
+            result = await self._query_device_direct(PARTITION_TYPE, part_id)
+            _LOGGER.info("Partition %d (type=0x%02X) query result: %s", part_id, PARTITION_TYPE, result)
+            if result and result['name']:
+                discovered['partitions'][part_id] = result
+                _LOGGER.info("Discovered partition %d: '%s'", part_id, result['name'])
+
+        for out_id in range(1, max_outputs + 1):
+            result = await self._query_device_direct(OUTPUT_TYPE, out_id)
+            if result and result['name'] and result['type_function'] != 0:
+                discovered['outputs'][out_id] = result
+                _LOGGER.debug("Discovered output %d: '%s'", out_id, result['name'])
+
+        _LOGGER.info("Discovery complete: %d zones, %d partitions, %d outputs",
+                     len(discovered['zones']), len(discovered['partitions']), len(discovered['outputs']))
+        return discovered
+
+    def set_monitored(self, zones=None, outputs=None, partitions=None):
+        """Update the lists of monitored devices after auto-discovery.
+
+        Call this after discover_devices() and before monitor_status() starts.
+        Each argument should be a dict keyed by device ID (same format as YAML config).
+        """
+        if zones is not None:
+            self._monitored_zones = zones
+        if outputs is not None:
+            self._monitored_outputs = outputs
+        if partitions is not None:
+            self._partitions = partitions
 
     def close(self):
         """Stop monitoring and close connection."""
