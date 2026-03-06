@@ -997,6 +997,21 @@ class AsyncSatel:
         _LOGGER.info("Starting device discovery (zones: %d, partitions: %d, outputs: %d)",
                      max_zones, max_partitions, max_outputs)
 
+        # Pre-flight: ETHM-1 Plus sometimes sends a non-standard initial frame
+        # on the first TCP connection and immediately closes it ("17-byte handshake").
+        # Send one harmless test query to trigger and detect this close, then reconnect.
+        _LOGGER.debug("Pre-flight connection test before discovery")
+        await self._query_device_direct(PARTITION_TYPE, 0, timeout=1.0)
+        if not self.connected:
+            _LOGGER.warning(
+                "ETHM closed connection on first query (initial handshake). "
+                "Reconnecting before discovery..."
+            )
+            if not await self.connect():
+                _LOGGER.error("Cannot reconnect for discovery — aborting")
+                return discovered
+            _LOGGER.info("Reconnected successfully. Starting discovery queries.")
+
         for zone_id in range(1, max_zones + 1):
             result = await self._query_device_direct(ZONE_TYPE, zone_id)
             if result and result['name']:
