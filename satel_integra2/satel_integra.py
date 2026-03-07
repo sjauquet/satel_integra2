@@ -1033,11 +1033,20 @@ class AsyncSatel:
                 discovered['partitions'][part_id] = result
                 _LOGGER.info("Discovered partition %d: '%s'", part_id, result['name'])
 
+        skipped_outputs = {}
         for out_id in range(1, max_outputs + 1):
             result = await self._query_device_direct(OUTPUT_TYPE, out_id)
-            if result and result['name'] and result['type_function'] != 0:
+            if result and (result['name'] or result['type_function']):
+                if not result['name']:
+                    result['name'] = f"Output {out_id}"
                 discovered['outputs'][out_id] = result
-                _LOGGER.debug("Discovered output %d: '%s'", out_id, result['name'])
+                _LOGGER.debug("Discovered output %d: '%s' (type_function=0x%02X)", out_id, result['name'], result['type_function'])
+            elif result:
+                skipped_outputs[out_id] = result['type_function']
+                _LOGGER.debug("Output %d: skipped (type_function=0x%02X, name empty)", out_id, result['type_function'])
+        if skipped_outputs:
+            _LOGGER.info("Outputs with ETHM response but skipped (type_function=0, no name): %s",
+                         {o: f"0x{t:02X}" for o, t in skipped_outputs.items()})
 
         _LOGGER.info("Discovery complete: %d zones, %d partitions, %d outputs",
                      len(discovered['zones']), len(discovered['partitions']), len(discovered['outputs']))
