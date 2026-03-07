@@ -695,16 +695,15 @@ class AsyncSatel:
 
         if mode == AlarmState.TRIGGERED or mode == AlarmState.TRIGGERED_FIRE:
             self.partition_armed_delay_timeout = 5
-            _LOGGER.warning("CHANGE DELAY partition (%s) update status delay to: %s sec",mode,self.partition_armed_delay_timeout)
+            _LOGGER.debug("Partition (%s) update delay: %s sec", mode, self.partition_armed_delay_timeout)
         elif mode == AlarmState.TRIGGERED_MEM or mode == AlarmState.TRIGGERED_MEM_FIRE:
-            _LOGGER.warning("NOT CHANGE DELAY partition (%s) update status delay to: %s sec",mode,self.partition_armed_delay_timeout)
-        
+            _LOGGER.debug("Partition (%s) no delay change, current: %s sec", mode, self.partition_armed_delay_timeout)
         elif mode == AlarmState.ARMED_SUPPRESSED or mode == AlarmState.ARMED_MODE0:
             self.partition_armed_delay_timeout = 20
-            _LOGGER.warning("CHANGE DELAY partition (%s) update status delay to: %s sec",mode,self.partition_armed_delay_timeout)
+            _LOGGER.debug("Partition (%s) update delay: %s sec", mode, self.partition_armed_delay_timeout)
         else:
             self.partition_armed_delay_timeout = 1
-            _LOGGER.warning("DELAY partition (%s) update status delay to: %s sec",mode,self.partition_armed_delay_timeout)
+            _LOGGER.debug("Partition (%s) update delay: %s sec", mode, self.partition_armed_delay_timeout)
             
     async def keep_alive(self):
         """A workaround for Satel Integra disconnecting after 25s.
@@ -722,7 +721,7 @@ class AsyncSatel:
             await asyncio.sleep(0.5)
             if self.partition_states_last_updated != 0 and time.time()-self.partition_states_last_updated > self.partition_armed_delay_timeout:
                 self.partition_states_last_updated = 0
-                _LOGGER.warning(" EXECUTED update partition status after %s sec delay",self.partition_armed_delay_timeout)
+                _LOGGER.debug("Partition status callback fired after %.1fs delay", self.partition_armed_delay_timeout)
                 self.partition_armed_delay_timeout = 2
                 if self._alarm_status_callback:
                     self._alarm_status_callback()
@@ -1012,6 +1011,7 @@ class AsyncSatel:
                 return discovered
             _LOGGER.info("Reconnected successfully. Starting discovery queries.")
 
+        skipped_zones = {}
         for zone_id in range(1, max_zones + 1):
             result = await self._query_device_direct(ZONE_TYPE, zone_id)
             if result and (result['name'] or result['type_function']):
@@ -1020,11 +1020,15 @@ class AsyncSatel:
                 discovered['zones'][zone_id] = result
                 _LOGGER.debug("Discovered zone %d: '%s' (type_function=0x%02X)", zone_id, result['name'], result['type_function'])
             elif result:
+                skipped_zones[zone_id] = result['type_function']
                 _LOGGER.debug("Zone %d: skipped (type_function=0x%02X, name empty)", zone_id, result['type_function'])
+        if skipped_zones:
+            _LOGGER.info("Zones with ETHM response but skipped (type_function=0, no name): %s",
+                         {z: f"0x{t:02X}" for z, t in skipped_zones.items()})
 
         for part_id in range(0, max_partitions + 1):
             result = await self._query_device_direct(PARTITION_TYPE, part_id)
-            _LOGGER.info("Partition %d (type=0x%02X) query result: %s", part_id, PARTITION_TYPE, result)
+            _LOGGER.debug("Partition %d query result: %s", part_id, result)
             if result and result['name']:
                 discovered['partitions'][part_id] = result
                 _LOGGER.info("Discovered partition %d: '%s'", part_id, result['name'])
@@ -1105,7 +1109,7 @@ class AsyncSatel:
         def message_handler(msg):
             if msg.msg_data[0] != type or msg.msg_data[1] != number:
                 return None
-            _LOGGER.info("Got device info: %s", msg.msg_data)
+            _LOGGER.debug("Got device info: %s", msg.msg_data)
             return msg.msg_data
 
         await self._send_message(SatelMessage(SatelCommand.CMD_DEVICE_INFO, bytearray([type, number])))
