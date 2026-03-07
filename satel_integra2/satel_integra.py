@@ -1017,16 +1017,55 @@ class AsyncSatel:
                 return discovered
             _LOGGER.info("Reconnected successfully. Starting discovery queries.")
 
-        # Phase 1 — send all queries (partitions, zones, outputs) with a small
-        # inter-query delay so the ETHM is not flooded all at once.
-        query_list = (
+        # Helper: collect DEVICE_INFO responses until idle for IDLE_TIMEOUT seconds.
+        async def _collect_responses(existing: dict) -> None:
+            loop = asyncio.get_event_loop()
+            overall_deadline = loop.time() + OVERALL_TIMEOUT
+            last_response_at = loop.time()
+            while True:
+                now = loop.time()
+                if now - last_response_at >= IDLE_TIMEOUT:
+                    _LOGGER.debug("Idle timeout reached (%.1f s without new response)", now - last_response_at)
+                    break
+                if now >= overall_deadline:
+                    _LOGGER.debug("Overall timeout reached during response collection")
+                    break
+                wait = min(overall_deadline - now, IDLE_TIMEOUT - (now - last_response_at) + 0.05)
+                try:
+                    frame = await asyncio.wait_for(self._read_frame(), timeout=wait)
+                except asyncio.TimeoutError:
+                    break
+                if not frame:
+                    _LOGGER.debug("Connection lost during discovery response collection")
+                    break
+                try:
+                    decoded = SatelMessage.decode_frame(frame)
+                except Exception as e:
+                    _LOGGER.debug("Frame decode error during discovery: %s", e)
+                    continue
+                if decoded is None or decoded.cmd != SatelCommand.DEVICE_INFO:
+                    continue
+                data = decoded.msg_data
+                if len(data) < 19:
+                    continue
+                key = (data[0], data[1])
+                if key not in existing:
+                    existing[key] = data
+                    last_response_at = loop.time()
+
+        responses: dict = {}
+
+        # Phase 1a — send partition + zone queries.
+        # Outputs are sent in a separate batch (Phase 1b) to avoid overflowing
+        # the ETHM command buffer (~160 slots). Sending all 289 queries at once
+        # causes the 128 output queries to be silently dropped.
+        zone_part_queries = (
             [(PARTITION_TYPE, i) for i in range(0, max_partitions + 1)] +
-            [(ZONE_TYPE,      i) for i in range(1, max_zones + 1)] +
-            [(OUTPUT_TYPE,    i) for i in range(1, max_outputs + 1)]
+            [(ZONE_TYPE,      i) for i in range(1, max_zones + 1)]
         )
-        _LOGGER.info("Sending %d discovery queries (%d ms apart)...",
-                     len(query_list), int(QUERY_INTERVAL * 1000))
-        for dtype, did in query_list:
+        _LOGGER.info("Pass 1/2: sending %d partition+zone queries (%d ms apart)...",
+                     len(zone_part_queries), int(QUERY_INTERVAL * 1000))
+        for dtype, did in zone_part_queries:
             if not self.connected:
                 _LOGGER.warning("Connection lost while sending discovery queries — stopping at (%d, %d)", dtype, did)
                 break
@@ -1034,46 +1073,34 @@ class AsyncSatel:
             await self._send_frame(msg.encode_frame())
             await asyncio.sleep(QUERY_INTERVAL)
 
-        # Phase 2 — collect responses until idle for IDLE_TIMEOUT seconds.
-        _LOGGER.debug("All queries sent. Collecting responses (idle timeout %.0fs, hard cap %.0fs)...",
+        # Phase 2a — collect partition + zone responses.
+        _LOGGER.debug("Pass 1/2 queries sent. Collecting responses (idle %.0fs, cap %.0fs)...",
                       IDLE_TIMEOUT, OVERALL_TIMEOUT)
-        responses: dict = {}  # (device_type, device_id) -> raw msg_data bytes
-        loop = asyncio.get_event_loop()
-        overall_deadline = loop.time() + OVERALL_TIMEOUT
-        last_response_at = loop.time()
+        await _collect_responses(responses)
+        _LOGGER.debug("Pass 1/2: %d device-info responses collected", len(responses))
 
-        while True:
-            now = loop.time()
-            if now - last_response_at >= IDLE_TIMEOUT:
-                _LOGGER.debug("Idle timeout reached (%.1f s without new response)", now - last_response_at)
-                break
-            if now >= overall_deadline:
-                _LOGGER.debug("Overall timeout reached during response collection")
-                break
-            wait = min(overall_deadline - now, IDLE_TIMEOUT - (now - last_response_at) + 0.05)
-            try:
-                frame = await asyncio.wait_for(self._read_frame(), timeout=wait)
-            except asyncio.TimeoutError:
-                break
-            if not frame:
-                _LOGGER.debug("Connection lost during discovery response collection")
-                break
-            try:
-                decoded = SatelMessage.decode_frame(frame)
-            except Exception as e:
-                _LOGGER.debug("Frame decode error during discovery: %s", e)
-                continue
-            if decoded is None or decoded.cmd != SatelCommand.DEVICE_INFO:
-                continue  # push notification — skip
-            data = decoded.msg_data
-            if len(data) < 19:
-                continue
-            key = (data[0], data[1])
-            if key not in responses:
-                responses[key] = data
-                last_response_at = loop.time()
+        # Phase 1b — send output queries as a separate batch.
+        if self.connected:
+            output_queries = [(OUTPUT_TYPE, i) for i in range(1, max_outputs + 1)]
+            _LOGGER.info("Pass 2/2: sending %d output queries (%d ms apart)...",
+                         len(output_queries), int(QUERY_INTERVAL * 1000))
+            for dtype, did in output_queries:
+                if not self.connected:
+                    _LOGGER.warning("Connection lost while sending output queries — stopping at (%d, %d)", dtype, did)
+                    break
+                msg = SatelMessage(SatelCommand.CMD_DEVICE_INFO, bytearray([dtype, did]))
+                await self._send_frame(msg.encode_frame())
+                await asyncio.sleep(QUERY_INTERVAL)
 
-        _LOGGER.debug("Collected %d device-info responses", len(responses))
+            # Phase 2b — collect output responses.
+            _LOGGER.debug("Pass 2/2 queries sent. Collecting responses (idle %.0fs, cap %.0fs)...",
+                          IDLE_TIMEOUT, OVERALL_TIMEOUT)
+            await _collect_responses(responses)
+            _LOGGER.debug("Pass 2/2: %d device-info responses total", len(responses))
+        else:
+            _LOGGER.warning("Connection lost before output queries — outputs not discovered")
+
+        _LOGGER.debug("Collected %d device-info responses total", len(responses))
 
         # Phase 3 — decode responses into discovered dict.
         skipped_zones = {}
