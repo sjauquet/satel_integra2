@@ -812,14 +812,23 @@ class AsyncSatel:
                 if not await self._send_frame(poll_msg.encode_frame()):
                     continue
 
-                # Step 3: read poll response (5-byte change bitmap, cmd byte = 0x7F)
-                poll_frame = await asyncio.wait_for(self._read_frame(), timeout=5)
-                if not poll_frame:
-                    continue
-
-                decoded = SatelMessage.decode_frame(poll_frame)
-                if decoded is None or decoded.cmd != SatelCommand.CMD_START_MONITORING:
-                    _LOGGER.warning("Unexpected response to poll: %s", decoded)
+                # Step 3: read poll response (5-byte change bitmap, cmd byte = 0x7F).
+                # The ETHM-1 may send status frames (ZONE_VIOLATED, OUTPUT_STATE, …)
+                # before the bitmap — dispatch them immediately and keep reading.
+                decoded = None
+                while True:
+                    poll_frame = await asyncio.wait_for(self._read_frame(), timeout=5)
+                    if not poll_frame:
+                        break
+                    frame_decoded = SatelMessage.decode_frame(poll_frame)
+                    if frame_decoded is None:
+                        break
+                    if frame_decoded.cmd == SatelCommand.CMD_START_MONITORING:
+                        decoded = frame_decoded
+                        break
+                    _LOGGER.debug("Status frame received during poll: %s", frame_decoded)
+                    self._dispatch_frame(poll_frame)
+                if decoded is None:
                     continue
 
                 # Step 4: query each changed status
