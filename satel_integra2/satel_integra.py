@@ -601,6 +601,13 @@ class AsyncSatel:
             _LOGGER.debug("-- Received frame  %s", hexlify(data))
             return data
 
+        except asyncio.IncompleteReadError as e:
+            # ETHM modules send a short non-standard handshake on the first TCP
+            # connection (typically 17 bytes without the \xFE\x0D terminator) then
+            # close.  This is expected — log at DEBUG to avoid log spam.
+            _LOGGER.debug("IncompleteReadError in _read_frame (%d bytes partial): %s", len(e.partial), e)
+            self._writer = None
+            self._reader = None
         except Exception as e:
             _LOGGER.warning("Got exception: %s. Most likely the other side has disconnected!!", e)
             self._writer = None
