@@ -1013,7 +1013,7 @@ class AsyncSatel:
 
         skipped_zones = {}
         for zone_id in range(1, max_zones + 1):
-            result = await self._query_device_direct(ZONE_TYPE, zone_id)
+            result = await self._query_device_direct(ZONE_TYPE, zone_id, timeout=0.5)
             if result and (result['name'] or result['type_function']):
                 if not result['name']:
                     result['name'] = f"Zone {zone_id}"
@@ -1035,7 +1035,7 @@ class AsyncSatel:
 
         skipped_outputs = {}
         for out_id in range(1, max_outputs + 1):
-            result = await self._query_device_direct(OUTPUT_TYPE, out_id)
+            result = await self._query_device_direct(OUTPUT_TYPE, out_id, timeout=0.5)
             if result and (result['name'] or result['type_function']):
                 if not result['name']:
                     result['name'] = f"Output {out_id}"
