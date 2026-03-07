@@ -995,8 +995,8 @@ class AsyncSatel:
         PARTITION_TYPE = 0x00
         OUTPUT_TYPE    = 0x04
         QUERY_INTERVAL = 0.01   # 10 ms between queries (HC2 uses setTimeout 10)
-        IDLE_TIMEOUT   = 5.0    # stop collecting if no new response for 5 s
-        OVERALL_TIMEOUT = 60.0  # hard cap for the collection phase
+        IDLE_TIMEOUT   = 15.0   # stop collecting if no new response for 15 s
+        OVERALL_TIMEOUT = 90.0  # hard cap for the collection phase
 
         discovered: dict = {'zones': {}, 'partitions': {}, 'outputs': {}}
 
