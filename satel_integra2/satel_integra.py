@@ -1014,9 +1014,13 @@ class AsyncSatel:
 
         for zone_id in range(1, max_zones + 1):
             result = await self._query_device_direct(ZONE_TYPE, zone_id)
-            if result and result['name']:
+            if result and (result['name'] or result['type_function']):
+                if not result['name']:
+                    result['name'] = f"Zone {zone_id}"
                 discovered['zones'][zone_id] = result
-                _LOGGER.debug("Discovered zone %d: '%s'", zone_id, result['name'])
+                _LOGGER.debug("Discovered zone %d: '%s' (type_function=0x%02X)", zone_id, result['name'], result['type_function'])
+            elif result:
+                _LOGGER.debug("Zone %d: skipped (type_function=0x%02X, name empty)", zone_id, result['type_function'])
 
         for part_id in range(0, max_partitions + 1):
             result = await self._query_device_direct(PARTITION_TYPE, part_id)
